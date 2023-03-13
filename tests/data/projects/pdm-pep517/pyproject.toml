@@ -1,0 +1,4 @@
+[build-system]
+# https://pdm.fming.dev/latest/pyproject/build/#build-configuration
+requires = ["pdm-pep517"]
+build-backend = "pdm.pep517.api"

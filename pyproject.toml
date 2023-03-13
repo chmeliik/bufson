@@ -1,0 +1,43 @@
+[build-system]
+requires = ["pdm-pep517>=1.0"]
+build-backend = "pdm.pep517.api"
+
+
+[project]
+name = "bufson"
+version = "0.1.0"
+description = "Build from source, no?"
+authors = [
+    {name = "Adam Cmiel", email = "acmiel1@gmail.com"},
+]
+dependencies = [
+    "build @ git+https://github.com/pypa/build",
+    "packaging>=23.0",
+    "pypi-simple>=1.1.0",
+]
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.scripts]
+bufson = "bufson:main"
+
+
+[tool.pdm]
+
+
+[tool.ruff]
+src = ["src", "tests"]
+select = ["ALL"]
+ignore = [
+    "D203",    # one-blank-line-before-class
+    "D213",    # multi-line-summary-second-line
+    "ANN101",  # missing-type-self
+    "ANN102",  # missing-type-cls
+    "COM",     # flake8-commas
+]
+
+[tool.ruff.per-file-ignores]
+"bufson.py" = [
+    "T20",  # print-found
+]

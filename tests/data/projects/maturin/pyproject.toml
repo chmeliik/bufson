@@ -1,0 +1,4 @@
+[build-system]
+# https://www.maturin.rs/#source-distribution
+requires = ["maturin>=0.14,<0.15"]
+build-backend = "maturin"
