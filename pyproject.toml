@@ -30,11 +30,12 @@ bufson = "bufson:main"
 src = ["src", "tests"]
 select = ["ALL"]
 ignore = [
-    "D203",    # one-blank-line-before-class
-    "D213",    # multi-line-summary-second-line
-    "ANN101",  # missing-type-self
-    "ANN102",  # missing-type-cls
-    "COM",     # flake8-commas
+    "D",        # pydocstyle
+    "ANN101",   # missing-type-self
+    "ANN102",   # missing-type-cls
+    "COM",      # flake8-commas
+    "EM",       # flake8-errmsg
+    "TRY",      # tryceratops
 ]
 
 [tool.ruff.per-file-ignores]
