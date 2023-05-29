@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import shutil
@@ -23,8 +24,6 @@ from packaging.version import InvalidVersion, Version
 log = logging.getLogger(__name__)
 log.addHandler(logging.StreamHandler())
 log.setLevel(logging.INFO)
-
-logging.getLogger("build").disabled = True
 
 pypi_client = pypi_simple.PyPISimple()
 
@@ -58,6 +57,14 @@ class DepID(NamedTuple):
             return f"{self.name}=={self.version}"
         return f"{self.name} @ {self.version.geturl()}"
 
+    def __lt__(self, other: DepID) -> bool:
+        def v(d: DepID) -> str:
+            return (
+                str(d.version) if isinstance(d.version, Version) else d.version.geturl()
+            )
+
+        return (self.name, v(self)) < (other.name, v(other))
+
     @classmethod
     def parse(cls, name: str, raw_version: str) -> Self:
         normalized_name = canonicalize_name(name)
@@ -82,10 +89,7 @@ DepGraph = dict[DepID, _DirectDeps]
 
 
 def to_depgraph(pipgrip_deps: Iterable[PipGripDep]) -> DepGraph:
-    root = DepID.parse("-root-", "file:.")
-    graph: DepGraph = {
-        root: _DirectDeps(runtime=[to_dep_id(d) for d in pipgrip_deps], build=[])
-    }
+    graph: DepGraph = {}
     _populate_depgraph(graph, pipgrip_deps)
     return graph
 
@@ -132,8 +136,8 @@ def _get_builddeps(dep_id: DepID) -> list[PipGripDep]:
 
     elif (url := dep_id.version).scheme.startswith("git"):
         scheme = url.scheme.removeprefix("git+")
-        path, _, ref = url.path.lstrip("/").rpartition("@")
-        repo_dir = Path(url.hostname or ".") / path
+        path, _, ref = url.path.partition("@")
+        repo_dir = Path(url.hostname or ".") / path.lstrip("/")
 
         if not repo_dir.exists():
             subprocess.run(
@@ -145,11 +149,15 @@ def _get_builddeps(dep_id: DepID) -> list[PipGripDep]:
                 ],
                 check=True,
             )
+        if ref:
             subprocess.run(["git", "checkout", ref], cwd=repo_dir, check=True)
 
         fragments = parse_qs(url.fragment)
         subdirectory = fragments.get("subdirectory", ["."])[0]
         project_dir = repo_dir / subdirectory
+
+    elif url.scheme == "file":
+        project_dir = Path(url.path)
 
     else:
         filename = Path(url.path).name
@@ -198,7 +206,17 @@ class Hash(NamedTuple):
 
 
 def main() -> None:
-    resolved = resolve_deps(["aiohttp", "idna"])
+    ap = argparse.ArgumentParser()
+    ap.add_argument("project_spec", default=".")
+    ap.add_argument("--allow-wheels", action="store_true")
+    args = ap.parse_args()
+
+    cfg["allow_wheels"] = args.allow_wheels
+
+    resolved = resolve_deps([args.project_spec])
+    if args.project_spec == ".":
+        resolved[0].name = "root"
+        resolved[0].version = "file:."
     graph = to_depgraph(resolved)
 
     def print_graph(
@@ -211,9 +229,6 @@ def main() -> None:
         for d in graph[root].build:
             print_graph(d, graph, depth + 1, "(B) ")
 
-    for root in resolved:
-        print_graph(to_dep_id(root), graph)
-
     def print_pins(dependents_map: dict[DepID, _DirectDependents]) -> None:
         for dep, dependents in dependents_map.items():
             print(dep)
@@ -223,9 +238,11 @@ def main() -> None:
             if not dependents_repr:
                 via = None
             if len(dependents_repr) == 1:
-                via = f"  # via {dependents_repr[0]}"
+                via = f"    # via {dependents_repr[0]}"
             else:
-                via = "\n".join(["  # via", *(f"  #   {d}" for d in dependents_repr)])
+                via = "\n".join(
+                    ["    # via", *(f"    #   {d}" for d in dependents_repr)]
+                )
 
             if via:
                 print(via)
