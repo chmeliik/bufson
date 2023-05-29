@@ -14,6 +14,7 @@ dependencies = [
     "build @ git+https://github.com/pypa/build",
     "packaging>=23.0",
     "pypi-simple>=1.1.0",
+    "pipgrip>=0.10.4",
 ]
 requires-python = ">=3.11"
 readme = "README.md"
