@@ -247,17 +247,17 @@ class Bufson:
         ) -> None:
             _run_cmd(cmd, cwd, extra_environ, logger=None)
 
+        builddeps = []
         try:
             with build.env.DefaultIsolatedEnv() as env:
                 builder = build.ProjectBuilder.from_isolated_env(
                     env, project_dir, subprocess_runner
                 )
                 builddeps = builder.build_system_requires
-
                 env.install(builddeps)
                 builddeps.update(builder.get_requires_for_build("wheel"))
-        except build.BuildException:
-            return []
+        except (build.BuildException, build.BuildBackendException):
+            pass
 
         return self.resolve_deps(builddeps)
 
