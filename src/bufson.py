@@ -26,9 +26,17 @@ from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import InvalidVersion, Version
 from yarl import URL
 
-log = logging.getLogger(__name__)
-log.addHandler(logging.StreamHandler())
-log.setLevel(logging.DEBUG)
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger(__name__)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)10s] %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return logger
+
+
+log = _get_logger()
 
 
 PathType = str | os.PathLike[str]
@@ -237,7 +245,7 @@ class Bufson:
             cwd: PathType | None = None,
             extra_environ: Mapping[str, str] | None = None,
         ) -> None:
-            _run_cmd(cmd, cwd, extra_environ)
+            _run_cmd(cmd, cwd, extra_environ, logger=None)
 
         try:
             with build.env.DefaultIsolatedEnv() as env:
@@ -272,12 +280,14 @@ def _run_cmd(
     cmd: Sequence[PathType],
     cwd: PathType | None = None,
     extra_environ: Mapping[str, str] | None = None,
+    logger: logging.Logger | None = log,
 ) -> str:
     env = os.environ.copy()
     if extra_environ:
         env.update(extra_environ)
 
-    log.debug("running %s", list(map(str, cmd)))
+    if logger:
+        logger.debug("running %s", list(map(str, cmd)))
     p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
     if p.returncode != 0:
         log.error(
@@ -310,7 +320,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--allow-wheels", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
 
     cache = Cache(Path("~/.cache/bufson").expanduser())
     config = Config(allow_wheels=args.allow_wheels)
