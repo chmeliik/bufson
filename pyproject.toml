@@ -15,6 +15,8 @@ dependencies = [
     "packaging>=23.0",
     "pypi-simple>=1.1.0",
     "pipgrip>=0.10.4",
+    "requests>=2.31.0",
+    "yarl>=1.9.2",
 ]
 requires-python = ">=3.11"
 readme = "README.md"

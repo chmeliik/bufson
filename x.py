@@ -1,51 +1,43 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Self
-from urllib.parse import SplitResult as URL
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs
+
+import requests
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
+    from collections.abc import Iterable, Mapping, Sequence
 
 import build
 import pydantic
 import pypi_simple
 from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import InvalidVersion, Version
+from yarl import URL
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.StreamHandler())
-log.setLevel(logging.INFO)
+log.setLevel(logging.DEBUG)
 
-pypi_client = pypi_simple.PyPISimple()
 
-cfg = {
-    "allow_wheels": False,
-}
+PathType = str | os.PathLike[str]
 
 
 class PipGripDep(pydantic.BaseModel):
     name: str
     version: str
     dependencies: list[PipGripDep] = []
-
-
-def resolve_deps(requirements: Iterable[str]) -> list[PipGripDep]:
-    requirements = list(requirements)
-    if not requirements:
-        return []
-    cmd = ["pipgrip", "--tree", "--json", *requirements]
-    log.info("running %s", cmd)
-    p = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE)
-    return list(map(PipGripDep.parse_obj, json.loads(p.stdout)))
 
 
 class DepID(NamedTuple):
@@ -55,15 +47,10 @@ class DepID(NamedTuple):
     def __str__(self) -> str:
         if isinstance(self.version, Version):
             return f"{self.name}=={self.version}"
-        return f"{self.name} @ {self.version.geturl()}"
+        return f"{self.name} @ {self.version}"
 
     def __lt__(self, other: DepID) -> bool:
-        def v(d: DepID) -> str:
-            return (
-                str(d.version) if isinstance(d.version, Version) else d.version.geturl()
-            )
-
-        return (self.name, v(self)) < (other.name, v(other))
+        return (self.name, str(self.version)) < (other.name, str(other.version))
 
     @classmethod
     def parse(cls, name: str, raw_version: str) -> Self:
@@ -71,13 +58,13 @@ class DepID(NamedTuple):
         try:
             version = Version(raw_version)
         except InvalidVersion:
-            version = urlsplit(raw_version)
+            version = URL(raw_version)
 
         return cls(normalized_name, version)
 
 
-def to_dep_id(d: PipGripDep) -> DepID:
-    return DepID.parse(d.name, d.version)
+def to_dep_id(dep: PipGripDep) -> DepID:
+    return DepID.parse(dep.name, dep.version)
 
 
 class _DirectDeps(NamedTuple):
@@ -88,38 +75,96 @@ class _DirectDeps(NamedTuple):
 DepGraph = dict[DepID, _DirectDeps]
 
 
-def to_depgraph(pipgrip_deps: Iterable[PipGripDep]) -> DepGraph:
-    graph: DepGraph = {}
-    _populate_depgraph(graph, pipgrip_deps)
-    return graph
+class Cache:
+    def __init__(self, root: PathType) -> None:
+        self._root = Path(root)
+
+    @property
+    def pipgrip_cache(self) -> Path:
+        return self._root / "pipgrip"
+
+    def get_sdist_cache(self) -> Path:
+        return self._mkdir("sdists")
+
+    def _mkdir(self, relpath: PathType) -> Path:
+        path = self._root / relpath
+        path.mkdir(exist_ok=True, parents=True)
+        return path
 
 
-def _populate_depgraph(graph: DepGraph, pipgrip_deps: Iterable[PipGripDep]) -> None:
-    def dedup(x: Iterable[DepID]) -> list[DepID]:
-        return list(dict.fromkeys(x))
-
-    for dep in pipgrip_deps:
-        dep_id = to_dep_id(dep)
-
-        if dep_id not in graph:
-            builddeps = _get_builddeps(dep_id)
-            graph[dep_id] = _DirectDeps(
-                runtime=dedup(map(to_dep_id, dep.dependencies)),
-                build=dedup(map(to_dep_id, builddeps)),
-            )
-            _populate_depgraph(graph, dep.dependencies)
-            _populate_depgraph(graph, builddeps)
+@dataclass
+class Config:
+    allow_wheels: bool = False
+    request_timeout: int = 60
 
 
-def _get_builddeps(dep_id: DepID) -> list[PipGripDep]:
-    if isinstance(dep_id.version, Version):
-        page = pypi_client.get_project_page(dep_id.name)
+class Bufson:
+    def __init__(
+        self,
+        cache: Cache,
+        config: Config,
+        pypi_client: pypi_simple.PyPISimple,
+    ) -> None:
+        self._cache = cache
+        self._config = config
+        self._pypi_client = pypi_client
+
+    def resolve_deps(self, requirements: Iterable[str]) -> list[PipGripDep]:
+        requirements = list(requirements)
+        if not requirements:
+            return []
+
+        cmd = [
+            "pipgrip",
+            "--cache-dir",
+            self._cache.pipgrip_cache,
+            "--tree",
+            "--json",
+            *requirements,
+        ]
+
+        output = _run_cmd(cmd)
+        return list(map(PipGripDep.parse_obj, json.loads(output)))
+
+    def build_depgraph(self, deps: Iterable[PipGripDep]) -> DepGraph:
+        graph: DepGraph = {}
+        self._populate_depgraph(graph, deps)
+        return graph
+
+    def _populate_depgraph(self, graph: DepGraph, deps: Iterable[PipGripDep]) -> None:
+        def dedup(x: Iterable[DepID]) -> list[DepID]:
+            return list(dict.fromkeys(x))
+
+        for dep in deps:
+            dep_id = to_dep_id(dep)
+
+            if dep_id not in graph:
+                builddeps = self._get_builddeps(dep_id)
+                graph[dep_id] = _DirectDeps(
+                    runtime=dedup(map(to_dep_id, dep.dependencies)),
+                    build=dedup(map(to_dep_id, builddeps)),
+                )
+                self._populate_depgraph(graph, dep.dependencies)
+                self._populate_depgraph(graph, builddeps)
+
+    def _get_builddeps(self, dep_id: DepID) -> list[PipGripDep]:
+        log.info("getting build dependencies for %s", dep_id)
+        if isinstance(dep_id.version, URL):
+            return self._get_builddeps_for_url_dep(dep_id.version)
+        return self._get_builddeps_for_pypi_dep(dep_id.name, dep_id.version)
+
+    def _get_builddeps_for_pypi_dep(
+        self, name: NormalizedName, version: Version
+    ) -> list[PipGripDep]:
+        page = self._pypi_client.get_project_page(name)
         dists = [
             pkg
             for pkg in page.packages
-            if pkg.version and Version(pkg.version) == dep_id.version
+            if pkg.version and Version(pkg.version) == version
         ]
-        if cfg["allow_wheels"] and any(dist.package_type == "wheel" for dist in dists):
+        if self._config.allow_wheels and any(
+            dist.package_type == "wheel" for dist in dists
+        ):
             return []
 
         try:
@@ -127,61 +172,122 @@ def _get_builddeps(dep_id: DepID) -> list[PipGripDep]:
         except StopIteration:
             return []
 
-        unpack_dir = Path(sdist.filename).with_suffix(".unpacked")
-        if not unpack_dir.exists():
-            pypi_client.download_package(sdist, sdist.filename)
-            shutil.unpack_archive(sdist.filename, unpack_dir)
+        sdist_path = self._cache.get_sdist_cache() / sdist.filename
+        if not sdist_path.exists():
+            self._pypi_client.download_package(sdist, sdist_path)
 
-        project_dir = next(unpack_dir.iterdir())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shutil.unpack_archive(sdist_path, tmpdir)
+            project_dir = _find_project_dir(tmpdir)
+            return self._get_builddeps_from_project_dir(project_dir)
 
-    elif (url := dep_id.version).scheme.startswith("git"):
+    def _get_builddeps_for_url_dep(self, url: URL) -> list[PipGripDep]:
+        if url.scheme == "file":
+            return self._get_builddeps_for_file_dep(Path(url.path))
+        if url.scheme == "git" or url.scheme.startswith("git+"):
+            return self._get_builddeps_for_git_dep(url)
+        if url.scheme in ("http", "https"):
+            return self._get_builddeps_for_http_dep(url)
+        raise ValueError(f"unsupported scheme in url: {url}")
+
+    def _get_builddeps_for_file_dep(self, path: Path) -> list[PipGripDep]:
+        if path.is_dir():
+            return self._get_builddeps_from_project_dir(path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shutil.unpack_archive(path, tmpdir)
+            project_dir = _find_project_dir(tmpdir)
+            return self._get_builddeps_from_project_dir(project_dir)
+
+    def _get_builddeps_for_git_dep(self, url: URL) -> list[PipGripDep]:
         scheme = url.scheme.removeprefix("git+")
         path, _, ref = url.path.partition("@")
-        repo_dir = Path(url.hostname or ".") / path.lstrip("/")
+        subdirectory = parse_qs(url.fragment).get("subdirectory", ["."])[0]
+        repo_url = url.with_scheme(scheme).with_path(path).with_fragment("")
 
-        if not repo_dir.exists():
-            subprocess.run(
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _run_cmd(
                 [
                     "git",
                     "clone",
-                    url._replace(scheme=scheme, path=path, fragment="").geturl(),
-                    repo_dir,
-                ],
-                check=True,
+                    "--filter=blob:none",
+                    "--no-checkout",
+                    str(repo_url),
+                    tmpdir,
+                ]
             )
-        if ref:
-            subprocess.run(["git", "checkout", ref], cwd=repo_dir, check=True)
+            _run_cmd(["git", "checkout", ref or "HEAD"], cwd=tmpdir)
+            project_dir = Path(tmpdir) / subdirectory
+            return self._get_builddeps_from_project_dir(project_dir)
 
-        fragments = parse_qs(url.fragment)
-        subdirectory = fragments.get("subdirectory", ["."])[0]
-        project_dir = repo_dir / subdirectory
+    def _get_builddeps_for_http_dep(self, url: URL) -> list[PipGripDep]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            archive_path = tmp_path / "archive.tar.gz"
+            unpack_dir = tmp_path / "unpacked"
 
-    elif url.scheme == "file":
-        project_dir = Path(url.path)
+            self._download_file(str(url), archive_path)
+            shutil.unpack_archive(archive_path, unpack_dir)
+            project_dir = _find_project_dir(unpack_dir)
+            return self._get_builddeps_from_project_dir(project_dir)
 
-    else:
-        filename = Path(url.path).name
-        unpack_dir = Path(filename).with_suffix(".unpacked")
-        if not unpack_dir.exists():
-            subprocess.run(["curl", "-fsS", "-o", filename, url.geturl()], check=True)
-            shutil.unpack_archive(filename, unpack_dir)
+    def _get_builddeps_from_project_dir(self, project_dir: Path) -> list[PipGripDep]:
+        def subprocess_runner(
+            cmd: Sequence[PathType],
+            cwd: PathType | None = None,
+            extra_environ: Mapping[str, str] | None = None,
+        ) -> None:
+            _run_cmd(cmd, cwd, extra_environ)
 
-        if len(files := list(unpack_dir.iterdir())) == 1 and files[0].is_dir():
-            project_dir = unpack_dir / files[0]
-        else:
-            project_dir = unpack_dir
+        try:
+            with build.env.DefaultIsolatedEnv() as env:
+                builder = build.ProjectBuilder.from_isolated_env(
+                    env, project_dir, subprocess_runner
+                )
+                builddeps = builder.build_system_requires
 
-    try:
-        with build.env.DefaultIsolatedEnv() as env:
-            builder = build.ProjectBuilder.from_isolated_env(env, project_dir)
-            build_deps = builder.build_system_requires
+                env.install(builddeps)
+                builddeps.update(builder.get_requires_for_build("wheel"))
+        except build.BuildException:
+            return []
 
-            env.install(build_deps)
-            build_deps.update(builder.get_requires_for_build("wheel"))
-    except build.BuildException:
-        return []
+        return self.resolve_deps(builddeps)
 
-    return resolve_deps(build_deps)
+    def _download_file(self, url: str, path: Path) -> None:
+        with requests.get(
+            url, stream=True, timeout=self._config.request_timeout
+        ) as resp, path.open("wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+
+def _find_project_dir(unpack_dir: PathType) -> Path:
+    unpack_dir = Path(unpack_dir)
+    if len(files := list(unpack_dir.iterdir())) == 1 and files[0].is_dir():
+        return unpack_dir / files[0]
+    return unpack_dir
+
+
+def _run_cmd(
+    cmd: Sequence[PathType],
+    cwd: PathType | None = None,
+    extra_environ: Mapping[str, str] | None = None,
+) -> str:
+    env = os.environ.copy()
+    if extra_environ:
+        env.update(extra_environ)
+
+    log.debug("running %s", list(map(str, cmd)))
+    p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    if p.returncode != 0:
+        log.error(
+            "`%s` failed.\nSTDOUT:\n%s\nSTDERR:%s",
+            " ".join(map(str, cmd)),
+            p.stdout,
+            p.stderr,
+        )
+    p.check_returncode()
+    return p.stdout
 
 
 _DirectDependents = _DirectDeps
@@ -200,24 +306,25 @@ def invert_graph(graph: DepGraph) -> dict[DepID, _DirectDependents]:
     return dependents
 
 
-class Hash(NamedTuple):
-    algorithm: str
-    digest: str
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("project_spec", default=".")
+    ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--allow-wheels", action="store_true")
     args = ap.parse_args()
 
-    cfg["allow_wheels"] = args.allow_wheels
+    cache = Cache(Path("~/.cache/bufson").expanduser())
+    config = Config(allow_wheels=args.allow_wheels)
+    pypi_client = pypi_simple.PyPISimple()
 
-    resolved = resolve_deps([args.project_spec])
-    if args.project_spec == ".":
-        resolved[0].name = "root"
-        resolved[0].version = "file:."
-    graph = to_depgraph(resolved)
+    bufson = Bufson(cache=cache, config=config, pypi_client=pypi_client)
+
+    with contextlib.chdir(args.path):
+        resolved = bufson.resolve_deps(["."])
+
+    resolved[0].name = "root"
+    resolved[0].version = Path(args.path).resolve().as_uri()
+
+    graph = bufson.build_depgraph(resolved)
 
     def print_graph(
         root: DepID, graph: DepGraph, depth: int = 0, prefix: str = ""
