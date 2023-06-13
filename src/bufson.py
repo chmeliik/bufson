@@ -30,7 +30,7 @@ from yarl import URL
 def _get_logger() -> logging.Logger:
     logger = logging.getLogger(__name__)
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)10s] %(message)s"))
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)7s] %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return logger
@@ -178,6 +178,10 @@ class Bufson:
         try:
             sdist = next(dist for dist in dists if dist.package_type == "sdist")
         except StopIteration:
+            log.warning(
+                "%s does not distribute sdist, could not get builddeps",
+                DepID(name, version),
+            )
             return []
 
         sdist_path = self._cache.get_sdist_cache() / sdist.filename
@@ -256,8 +260,16 @@ class Bufson:
                 builddeps = builder.build_system_requires
                 env.install(builddeps)
                 builddeps.update(builder.get_requires_for_build("wheel"))
-        except (build.BuildException, build.BuildBackendException):
-            pass
+        except build.BuildException as e:
+            log.warning("failed to get build dependencies from pyproject.toml: %s", e)
+            log.warning(
+                "cannot attempt to get extra build dependencies from get_requires_for_build_wheel"
+            )
+        except build.BuildBackendException as e:
+            log.warning(
+                "failed to get extra build dependencies from get_requires_for_build_wheel: %s",
+                e,
+            )
 
         return self.resolve_deps(builddeps)
 
@@ -332,7 +344,10 @@ def main() -> None:
 
     bufson = Bufson(cache=cache, config=config, pypi_client=pypi_client)
 
-    with contextlib.chdir(args.path):
+    log.info("processing %s", args.path)
+    path = Path(args.path).resolve()
+
+    with contextlib.chdir(path):
         resolved = bufson.resolve_deps(["."])
 
     resolved[0].name = "root"
