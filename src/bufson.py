@@ -11,20 +11,20 @@ import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, Self
+from typing import IO, TYPE_CHECKING, NamedTuple, NewType, Self
 from urllib.parse import parse_qs
-
-import requests
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
 
 import build
 import pydantic
 import pypi_simple
+import requests
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import InvalidVersion, Version
 from yarl import URL
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping, Sequence
 
 
 def _get_logger() -> logging.Logger:
@@ -40,6 +40,18 @@ log = _get_logger()
 
 
 PathType = str | os.PathLike[str]
+
+NormalizedReqStr = NewType("NormalizedReqStr", str)
+
+
+def _normalize_requirement_string(req_str: str) -> NormalizedReqStr:
+    try:
+        req = Requirement(req_str)
+    except InvalidRequirement:
+        return NormalizedReqStr(req_str)
+
+    req.name = canonicalize_name(req.name)
+    return NormalizedReqStr(str(req))
 
 
 class PipGripDep(pydantic.BaseModel):
@@ -116,13 +128,26 @@ class Bufson:
         self._cache = cache
         self._config = config
         self._pypi_client = pypi_client
+        self._resolution_cache: dict[frozenset[NormalizedReqStr], list[PipGripDep]] = {}
 
     def resolve_deps(self, requirements: Iterable[str]) -> list[PipGripDep]:
-        requirements = list(requirements)
-        if not requirements:
+        normalized_requirements = list(map(_normalize_requirement_string, requirements))
+        if not normalized_requirements:
             return []
+        return self._cached_resolve_deps(normalized_requirements)
 
-        cmd = [
+    def _cached_resolve_deps(
+        self, requirements: list[NormalizedReqStr]
+    ) -> list[PipGripDep]:
+        key = frozenset(requirements)
+        if (resolved := self._resolution_cache.get(key)) is not None:
+            log.debug(
+                "already resolved runtime dependencies for %s", ", ".join(requirements)
+            )
+            return resolved
+
+        log.debug("resolving runtime dependencies for %s", ", ".join(requirements))
+        cmd: list[str | PathType] = [
             "pipgrip",
             "--cache-dir",
             self._cache.pipgrip_cache,
@@ -130,9 +155,11 @@ class Bufson:
             "--json",
             *requirements,
         ]
-
         output = _run_cmd(cmd)
-        return list(map(PipGripDep.parse_obj, json.loads(output)))
+
+        resolved = list(map(PipGripDep.parse_obj, json.loads(output)))
+        self._resolution_cache[key] = resolved
+        return resolved
 
     def build_depgraph(self, deps: Iterable[PipGripDep]) -> DepGraph:
         graph: DepGraph = {}
