@@ -340,13 +340,12 @@ def _run_cmd(
     return p.stdout
 
 
-_DirectDependents = _DirectDeps
+DependentsGraph = NewType("DependentsGraph", dict[DepID, _DirectDeps])
 
 
-def invert_graph(graph: DepGraph) -> dict[DepID, _DirectDependents]:
-    dependents: dict[DepID, _DirectDependents] = defaultdict(
-        lambda: _DirectDependents(runtime=[], build=[])
-    )
+def invert_graph(graph: DepGraph) -> DependentsGraph:
+    dependents = DependentsGraph(defaultdict(lambda: _DirectDeps(runtime=[], build=[])))
+
     for dependent, dependencies in graph.items():
         for runtime_dep in dependencies.runtime:
             dependents[runtime_dep].runtime.append(dependent)
@@ -354,6 +353,61 @@ def invert_graph(graph: DepGraph) -> dict[DepID, _DirectDependents]:
             dependents[build_dep].build.append(dependent)
 
     return dependents
+
+
+# requirements file: subset of dependents graph such that each *name*
+# (not name+version) appears only once
+
+
+def _find_runtime_deps(deps: DepGraph, root: DepID) -> set[DepID]:
+    stack = [root]
+    runtime_deps = set()
+
+    while stack:
+        pkg = stack.pop()
+        runtime_deps.add(pkg)
+        stack.extend(dep for dep in deps[pkg].runtime if dep not in runtime_deps)
+
+    runtime_deps.remove(root)
+    return runtime_deps
+
+
+def _split_on_name_conflict(graph: DependentsGraph) -> list[DependentsGraph]:
+    graphs: list[DependentsGraph] = []
+    names_in_graph: list[set[NormalizedName]] = []
+
+    def first_nonconflicting(name: NormalizedName) -> int | None:
+        return next(
+            (i for i in range(len(graphs)) if name not in names_in_graph[i]), None
+        )
+
+    for dep_id, dependents in graph.items():
+        if (i := first_nonconflicting(dep_id.name)) is None:
+            graphs.append(DependentsGraph({}))
+            names_in_graph.append(set())
+            i = len(graphs) - 1
+
+        graphs[i][dep_id] = dependents
+        names_in_graph[i].add(dep_id.name)
+
+    return graphs
+
+
+def print_requirements_file(graph: DependentsGraph, f: IO[str]) -> None:
+    for dep, dependents in graph.items():
+        print(dep, file=f)
+        dependents_repr = [str(rtd) for rtd in dependents.runtime]
+        dependents_repr.extend(f"build({bd})" for bd in dependents.build)
+
+        if not dependents_repr:
+            via = None
+        if len(dependents_repr) == 1:
+            via = f"    # via {dependents_repr[0]}"
+        else:
+            via = "\n".join(["    # via", *(f"    #   {d}" for d in dependents_repr)])
+
+        if via:
+            print(via, file=f)
 
 
 def main() -> None:
@@ -378,40 +432,44 @@ def main() -> None:
     with contextlib.chdir(path):
         resolved = bufson.resolve_deps(["."])
 
-    resolved[0].name = "root"
-    resolved[0].version = Path(args.path).resolve().as_uri()
+    resolved[0].name = path.name
+    resolved[0].version = path.as_uri()
 
     graph = bufson.build_depgraph(resolved)
+    dependents_graph = invert_graph(graph)
 
-    def print_graph(
-        root: DepID, graph: DepGraph, depth: int = 0, prefix: str = ""
-    ) -> None:
-        indent = " " * 2 * depth
-        print(indent, prefix, root, sep="")
-        for d in graph[root].runtime:
-            print_graph(d, graph, depth + 1, "(R) ")
-        for d in graph[root].build:
-            print_graph(d, graph, depth + 1, "(B) ")
+    root = next(node for node in graph if node not in dependents_graph)
+    runtime_deps = _find_runtime_deps(graph, root)
 
-    def print_pins(dependents_map: dict[DepID, _DirectDependents]) -> None:
-        for dep, dependents in dependents_map.items():
-            print(dep)
-            dependents_repr = [str(rtd) for rtd in dependents.runtime]
-            dependents_repr.extend(f"build({bd})" for bd in dependents.build)
+    runtime_graph = DependentsGraph(
+        {
+            dep: dependents
+            for dep, dependents in dependents_graph.items()
+            if dep in runtime_deps
+        }
+    )
+    build_graph = DependentsGraph(
+        {
+            dep: dependents
+            for dep, dependents in dependents_graph.items()
+            if dependents.build
+        }
+    )
 
-            if not dependents_repr:
-                via = None
-            if len(dependents_repr) == 1:
-                via = f"    # via {dependents_repr[0]}"
-            else:
-                via = "\n".join(
-                    ["    # via", *(f"    #   {d}" for d in dependents_repr)]
-                )
+    log.info("writing requirements.txt")
+    with Path("requirements.txt").open("w") as f:
+        print_requirements_file(runtime_graph, f)
 
-            if via:
-                print(via)
+    for i, req_file in enumerate(_split_on_name_conflict(build_graph)):
+        file_name = (
+            "requirements-build.txt"
+            if i == 0
+            else f"requirements-build-conflict{i}.txt"
+        )
+        log.info("writing %s", file_name)
 
-    print_pins(invert_graph(graph))
+        with Path(file_name).open("w") as f:
+            print_requirements_file(req_file, f)
 
 
 if __name__ == "__main__":
