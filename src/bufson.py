@@ -452,7 +452,7 @@ def main() -> None:
         {
             dep: dependents
             for dep, dependents in dependents_graph.items()
-            if dependents.build
+            if dep not in runtime_deps
         }
     )
 
