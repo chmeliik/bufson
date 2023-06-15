@@ -69,14 +69,15 @@ class DepID(NamedTuple):
             return f"{self.name}=={self.version}"
         return f"{self.name} @ {self.version}"
 
-    def __lt__(self, other: DepID) -> bool:
-        return (self.name, str(self.version)) < (other.name, str(other.version))
+    def __lt__(self, other: tuple[NormalizedName, Version | URL]) -> bool:
+        other_name, other_version = other
+        return (self.name, str(self.version)) < (other_name, str(other_version))
 
     @classmethod
     def parse(cls, name: str, raw_version: str) -> Self:
         normalized_name = canonicalize_name(name)
         try:
-            version = Version(raw_version)
+            version: Version | URL = Version(raw_version)
         except InvalidVersion:
             version = URL(raw_version)
 
@@ -278,7 +279,7 @@ class Bufson:
         ) -> None:
             _run_cmd(cmd, cwd, extra_environ, logger=None)
 
-        builddeps = []
+        builddeps = set()
         try:
             with build.env.DefaultIsolatedEnv() as env:
                 builder = build.ProjectBuilder.from_isolated_env(
@@ -316,7 +317,7 @@ def _find_project_dir(unpack_dir: PathType) -> Path:
 
 
 def _run_cmd(
-    cmd: Sequence[PathType],
+    cmd: Sequence[str | PathType],
     cwd: PathType | None = None,
     extra_environ: Mapping[str, str] | None = None,
     logger: logging.Logger | None = log,
