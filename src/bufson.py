@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, NamedTuple, NewType, Self
+from typing import IO, TYPE_CHECKING, NamedTuple, NewType, Self, cast
 from urllib.parse import parse_qs
 
 import build
@@ -96,6 +97,14 @@ class _DirectDeps(NamedTuple):
 DepGraph = dict[DepID, _DirectDeps]
 
 
+class Hash(NamedTuple):
+    algorithm: str
+    digest: str
+
+    def __str__(self) -> str:
+        return f"{self.algorithm}:{self.digest}"
+
+
 class Cache:
     def __init__(self, root: PathType) -> None:
         self._root = Path(root)
@@ -130,6 +139,7 @@ class Bufson:
         self._config = config
         self._pypi_client = pypi_client
         self._resolution_cache: dict[frozenset[NormalizedReqStr], list[PipGripDep]] = {}
+        self._expected_hashes: dict[DepID, list[Hash]] = {}
 
     def resolve_deps(self, requirements: Iterable[str]) -> list[PipGripDep]:
         normalized_requirements = list(map(_normalize_requirement_string, requirements))
@@ -167,6 +177,9 @@ class Bufson:
         self._populate_depgraph(graph, deps)
         return graph
 
+    def get_expected_hashes(self) -> dict[DepID, list[Hash]]:
+        return self._expected_hashes
+
     def _populate_depgraph(self, graph: DepGraph, deps: Iterable[PipGripDep]) -> None:
         def dedup(x: Iterable[DepID]) -> list[DepID]:
             return list(dict.fromkeys(x))
@@ -186,17 +199,21 @@ class Bufson:
     def _get_builddeps(self, dep_id: DepID) -> list[PipGripDep]:
         log.info("getting build dependencies for %s", dep_id)
         if isinstance(dep_id.version, URL):
-            return self._get_builddeps_for_url_dep(dep_id.version)
-        return self._get_builddeps_for_pypi_dep(dep_id.name, dep_id.version)
+            return self._get_builddeps_for_url_dep(dep_id)
+        return self._get_builddeps_for_pypi_dep(dep_id)
 
-    def _get_builddeps_for_pypi_dep(
-        self, name: NormalizedName, version: Version
-    ) -> list[PipGripDep]:
+    def _get_builddeps_for_pypi_dep(self, dep_id: DepID) -> list[PipGripDep]:
+        name, version = dep_id
         page = self._pypi_client.get_project_page(name)
         dists = [
             pkg
             for pkg in page.packages
             if pkg.version and Version(pkg.version) == version
+        ]
+        self._expected_hashes[dep_id] = [
+            Hash(algorithm, digest)
+            for dist in dists
+            for algorithm, digest in dist.digests.items()
         ]
         if self._config.allow_wheels and any(
             dist.package_type == "wheel" for dist in dists
@@ -221,25 +238,35 @@ class Bufson:
             project_dir = _find_project_dir(tmpdir)
             return self._get_builddeps_from_project_dir(project_dir)
 
-    def _get_builddeps_for_url_dep(self, url: URL) -> list[PipGripDep]:
+    def _get_builddeps_for_url_dep(self, dep_id: DepID) -> list[PipGripDep]:
+        url = cast(URL, dep_id.version)
         if url.scheme == "file":
-            return self._get_builddeps_for_file_dep(Path(url.path))
+            return self._get_builddeps_for_file_dep(dep_id)
         if url.scheme == "git" or url.scheme.startswith("git+"):
-            return self._get_builddeps_for_git_dep(url)
+            return self._get_builddeps_for_git_dep(dep_id)
         if url.scheme in ("http", "https"):
-            return self._get_builddeps_for_http_dep(url)
+            return self._get_builddeps_for_http_dep(dep_id)
         raise ValueError(f"unsupported scheme in url: {url}")
 
-    def _get_builddeps_for_file_dep(self, path: Path) -> list[PipGripDep]:
+    def _get_builddeps_for_file_dep(self, dep_id: DepID) -> list[PipGripDep]:
+        url = cast(URL, dep_id.version)
+        path = Path(url.path)
         if path.is_dir():
             return self._get_builddeps_from_project_dir(path)
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            with path.open("rb") as f:
+                sha256 = hashlib.sha256()
+                for chunk in iter(lambda: f.read(8192), b""):
+                    sha256.update(chunk)
+                self._expected_hashes[dep_id] = [Hash("sha256", sha256.hexdigest())]
+
             shutil.unpack_archive(path, tmpdir)
             project_dir = _find_project_dir(tmpdir)
             return self._get_builddeps_from_project_dir(project_dir)
 
-    def _get_builddeps_for_git_dep(self, url: URL) -> list[PipGripDep]:
+    def _get_builddeps_for_git_dep(self, dep_id: DepID) -> list[PipGripDep]:
+        url = cast(URL, dep_id.version)
         scheme = url.scheme.removeprefix("git+")
         path, _, ref = url.path.partition("@")
         subdirectory = parse_qs(url.fragment).get("subdirectory", ["."])[0]
@@ -260,13 +287,16 @@ class Bufson:
             project_dir = Path(tmpdir) / subdirectory
             return self._get_builddeps_from_project_dir(project_dir)
 
-    def _get_builddeps_for_http_dep(self, url: URL) -> list[PipGripDep]:
+    def _get_builddeps_for_http_dep(self, dep_id: DepID) -> list[PipGripDep]:
+        url = cast(URL, dep_id.version)
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             archive_path = tmp_path / "archive.tar.gz"
             unpack_dir = tmp_path / "unpacked"
 
-            self._download_file(str(url), archive_path)
+            sha256 = self._download_file(str(url), archive_path)
+            self._expected_hashes[dep_id] = [sha256]
+
             shutil.unpack_archive(archive_path, unpack_dir)
             project_dir = _find_project_dir(unpack_dir)
             return self._get_builddeps_from_project_dir(project_dir)
@@ -301,12 +331,17 @@ class Bufson:
 
         return self.resolve_deps(builddeps)
 
-    def _download_file(self, url: str, path: Path) -> None:
+    def _download_file(self, url: str, path: Path) -> Hash:
+        sha256 = hashlib.sha256()
+
         with requests.get(
             url, stream=True, timeout=self._config.request_timeout
         ) as resp, path.open("wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
+                sha256.update(chunk)
+
+        return Hash("sha256", sha256.hexdigest())
 
 
 def _find_project_dir(unpack_dir: PathType) -> Path:
@@ -393,9 +428,15 @@ def _split_on_name_conflict(graph: DependentsGraph) -> list[DependentsGraph]:
     return graphs
 
 
-def print_requirements_file(graph: DependentsGraph, f: IO[str]) -> None:
+def print_requirements_file(
+    graph: DependentsGraph, expected_hashes: dict[DepID, list[Hash]], f: IO[str]
+) -> None:
     for dep, dependents in graph.items():
-        print(dep, file=f)
+        hashes = expected_hashes.get(dep, [])
+        hash_lines = [f"    --hash={h}" for h in sorted(hashes)]
+        dep_str = " \\\n".join([str(dep), *hash_lines])
+        print(dep_str, file=f)
+
         dependents_repr = [str(rtd) for rtd in dependents.runtime]
         dependents_repr.extend(f"build({bd})" for bd in dependents.build)
 
@@ -415,6 +456,7 @@ def main() -> None:
     ap.add_argument("path", nargs="?", default=".")
     ap.add_argument("--allow-wheels", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--no-hashes", action="store_true")
     args = ap.parse_args()
 
     if args.verbose:
@@ -456,9 +498,11 @@ def main() -> None:
         }
     )
 
+    hashes = bufson.get_expected_hashes() if not args.no_hashes else {}
+
     log.info("writing requirements.txt")
     with Path("requirements.txt").open("w") as f:
-        print_requirements_file(runtime_graph, f)
+        print_requirements_file(runtime_graph, hashes, f)
 
     for i, req_file in enumerate(_split_on_name_conflict(build_graph)):
         file_name = (
@@ -469,7 +513,7 @@ def main() -> None:
         log.info("writing %s", file_name)
 
         with Path(file_name).open("w") as f:
-            print_requirements_file(req_file, f)
+            print_requirements_file(req_file, hashes, f)
 
 
 if __name__ == "__main__":
